@@ -26,8 +26,12 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.ComponentActivity
 import androidx.core.app.NotificationCompat
+import androidx.core.app.PictureInPictureModeChangedInfo
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.util.Consumer
+import androidx.core.view.WindowCompat
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
@@ -72,6 +76,9 @@ class GlCallPipPlugin : FlutterPlugin,
     private var overlayView: View? = null
     private var windowManager: WindowManager? = null
 
+    /** Forwards OS PiP enter/exit to Flutter (share return, rotation, etc.). */
+    private var pipModeChangedConsumer: Consumer<PictureInPictureModeChangedInfo>? = null
+
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         applicationContext = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "gl_call_pip")
@@ -93,11 +100,14 @@ class GlCallPipPlugin : FlutterPlugin,
 
         // Handle launch via notification/overlay clicks
         checkInitialIntent(binding.activity.intent)
+
+        registerPictureInPictureModeListener(binding.activity)
     }
 
     override fun onDetachedFromActivityForConfigChanges() {
         binding?.removeOnUserLeaveHintListener(this)
         binding?.removeOnNewIntentListener(this)
+        unregisterPictureInPictureModeListener()
         unregisterReceiver()
         hideGlobalBanner()
         binding = null
@@ -111,10 +121,42 @@ class GlCallPipPlugin : FlutterPlugin,
     override fun onDetachedFromActivity() {
         binding?.removeOnUserLeaveHintListener(this)
         binding?.removeOnNewIntentListener(this)
+        unregisterPictureInPictureModeListener()
         unregisterReceiver()
         hideGlobalBanner()
         binding = null
         activity = null
+    }
+
+    private fun registerPictureInPictureModeListener(act: Activity) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val component = act as? ComponentActivity ?: return
+        unregisterPictureInPictureModeListener()
+        val consumer = Consumer<PictureInPictureModeChangedInfo> { info ->
+            mainHandler.post {
+                try {
+                    channel.invokeMethod(
+                        "onPipModeChanged",
+                        mapOf("inPip" to info.isInPictureInPictureMode),
+                    )
+                } catch (_: Exception) {
+                }
+            }
+        }
+        pipModeChangedConsumer = consumer
+        component.addOnPictureInPictureModeChangedListener(consumer)
+    }
+
+    private fun unregisterPictureInPictureModeListener() {
+        val component = activity as? ComponentActivity
+        val consumer = pipModeChangedConsumer
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && component != null && consumer != null) {
+            try {
+                component.removeOnPictureInPictureModeChangedListener(consumer)
+            } catch (_: Exception) {
+            }
+        }
+        pipModeChangedConsumer = null
     }
 
     // Minimize hint
@@ -123,13 +165,6 @@ class GlCallPipPlugin : FlutterPlugin,
 
         if (autoEnterOnUserLeave && Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             enterPipInternal()
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            mainHandler.postDelayed({
-                val inPip = activity?.isInPictureInPictureMode == true
-                if (inPip) {
-                    try { channel.invokeMethod("onPipModeChanged", mapOf("inPip" to true)) } catch (_: Exception) {}
-                }
-            }, 200)
         }
     }
 
@@ -256,6 +291,11 @@ class GlCallPipPlugin : FlutterPlugin,
                 result.success(null)
             }
 
+            "stop" -> {
+                // iOS uses this to tear down native PiP; Android PiP is activity-driven — no-op, avoid MissingPluginException.
+                result.success(null)
+            }
+
             else -> result.notImplemented()
         }
     }
@@ -282,9 +322,7 @@ class GlCallPipPlugin : FlutterPlugin,
             return try {
                 act.setPictureInPictureParams(params)
                 val ok = act.enterPictureInPictureMode(params)
-                if (ok) {
-                    try { channel.invokeMethod("onPipModeChanged", mapOf("inPip" to true)) } catch (_: Exception) {}
-                }
+                // PiP true/false is delivered via OnPictureInPictureModeChangedListener to avoid duplicate/out-of-order events.
                 ok
             } catch (e: Exception) {
                 Log.e("CallPipPlugin", "enterPiP failed", e)
@@ -313,11 +351,21 @@ class GlCallPipPlugin : FlutterPlugin,
         val intent = Intent(act, act.javaClass).apply {
             addFlags(
                 Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or
-                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP
             )
         }
         act.startActivity(intent)
+        // After external intents (e.g. share), relayout so Flutter/system bars and bottom controls get correct insets.
+        mainHandler.post {
+            try {
+                val w = act.window ?: return@post
+                WindowCompat.setDecorFitsSystemWindows(w, true)
+                w.decorView.requestApplyInsets()
+                w.decorView.invalidate()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     private fun registerReceiver() {
@@ -491,6 +539,25 @@ class GlCallPipPlugin : FlutterPlugin,
         return if (resId > 0) applicationContext.resources.getDimensionPixelSize(resId) else 0
     }
 
+    /** Y offset for top overlay: status bar + display cutout when activity insets are available. */
+    private fun overlayTopYOffset(): Int {
+        val act = activity
+        if (act == null) return statusBarHeight()
+        return try {
+            val wi = act.window?.decorView?.rootWindowInsets
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && wi != null) {
+                val top = wi.getInsets(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.displayCutout()).top
+                kotlin.math.max(statusBarHeight(), top)
+            } else {
+                @Suppress("DEPRECATION")
+                val top = wi?.stableInsetTop ?: 0
+                kotlin.math.max(statusBarHeight(), top)
+            }
+        } catch (_: Exception) {
+            statusBarHeight()
+        }
+    }
+
     private fun showGlobalBanner(title: String, text: String, route: String?) {
         if (overlayView != null) return
         if (!hasOverlayPermission()) return
@@ -542,12 +609,15 @@ class GlCallPipPlugin : FlutterPlugin,
             WindowManager.LayoutParams.WRAP_CONTENT,
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            y = statusBarHeight() // just below status bar
+            y = overlayTopYOffset()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+            }
         }
 
         windowManager?.addView(container, lp)
@@ -565,21 +635,25 @@ class GlCallPipPlugin : FlutterPlugin,
 
 
     private fun startOngoingCallChip(title: String, text: String, route: String, startMs: Long) {
-    val ctx = applicationContext
-    val i = Intent(ctx, OngoingCallService::class.java).apply {
-        putExtra("title", title)
-        putExtra("text", text)
-        putExtra("route", route)
-        putExtra("startMs", startMs)
-      }
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-          ctx.startForegroundService(i)
-      } else {
-          ctx.startService(i)
-      }
+        val ctx = applicationContext
+        @Suppress("UNCHECKED_CAST")
+        val serviceClass = Class.forName("com.gl.gl_call_pip.OngoingCallService") as Class<*>
+        val i = Intent(ctx, serviceClass).apply {
+            putExtra("title", title)
+            putExtra("text", text)
+            putExtra("route", route)
+            putExtra("startMs", startMs)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            ctx.startForegroundService(i)
+        } else {
+            ctx.startService(i)
+        }
     }
 
-  private fun stopOngoingCallChip() {
-      applicationContext.stopService(Intent(applicationContext, OngoingCallService::class.java))
-  }
+    private fun stopOngoingCallChip() {
+        @Suppress("UNCHECKED_CAST")
+        val serviceClass = Class.forName("com.gl.gl_call_pip.OngoingCallService") as Class<*>
+        applicationContext.stopService(Intent(applicationContext, serviceClass))
+    }
 }

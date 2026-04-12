@@ -64,3 +64,9 @@ android {
         }
     }
 }
+
+dependencies {
+    // PiP mode callbacks (FlutterFragmentActivity / ComponentActivity).
+    implementation("androidx.activity:activity:1.9.3")
+    implementation("androidx.core:core:1.15.0")
+}
