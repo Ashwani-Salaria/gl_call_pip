@@ -35,6 +35,10 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.PluginRegistry
 
+/**
+ * PiP + ongoing-call UI. Does not tear down the Flutter engine or surfaces; leave that to Flutter/Agora.
+ * [onUserLeaveHint] only signals Dart so the app can enter PiP or adjust UI without releasing textures here.
+ */
 class GlCallPipPlugin : FlutterPlugin,
     MethodChannel.MethodCallHandler,
     ActivityAware,
